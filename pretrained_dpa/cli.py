@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import logging
 import shutil
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pretrained-dpa" / "models"
-COUNTRY_API_URL = "https://ipinfo.io/country"
-HF_ORIGIN = "https://huggingface.co"
-HF_MIRROR = "https://hf-mirror.com"
+DOWNLOAD_TIMEOUT_SECONDS = 120
+SOURCE_PROBE_TIMEOUT_SECONDS = 8
 LOGGER = logging.getLogger(__name__)
 
 
@@ -25,11 +27,11 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
 
-def _load_model_map() -> dict[str, dict[str, str]]:
+def _load_model_map() -> dict[str, dict[str, Any]]:
     """Load model metadata from packaged JSON."""
     data_path = files("pretrained_dpa").joinpath("models.json")
     with data_path.open("r", encoding="utf-8") as f:
-        data: dict[str, dict[str, str]] = json.load(f)
+        data: dict[str, dict[str, Any]] = json.load(f)
     return data
 
 
@@ -49,7 +51,7 @@ def _download_file(url: str, destination: Path) -> None:
 
     try:
         with (
-            urllib.request.urlopen(url, timeout=120) as response,  # noqa: S310
+            urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response,  # noqa: S310
             tmp_path.open("wb") as out_file,
         ):
             shutil.copyfileobj(response, out_file)
@@ -69,31 +71,68 @@ def _sha256sum(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _is_in_china() -> bool:
-    """Return whether runtime appears to be in mainland China."""
+def _model_download_urls(model_info: dict[str, Any]) -> list[str]:
+    """Return candidate download URLs for a model (deduplicated, ordered)."""
+    candidates: list[str] = []
+
+    raw_urls = model_info.get("urls")
+    if isinstance(raw_urls, list):
+        candidates.extend(item for item in raw_urls if isinstance(item, str))
+
+    if not candidates and isinstance(model_info.get("url"), str):
+        candidates.append(model_info["url"])
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in candidates:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+
+    return unique
+
+
+def _probe_download_url(url: str) -> float | None:
+    """Probe one URL and return latency seconds if reachable, else None."""
+    _validate_download_url(url)
+    request = urllib.request.Request(  # noqa: S310
+        url,
+        headers={"Range": "bytes=0-0"},
+        method="GET",
+    )
+    start = time.monotonic()
     try:
-        with urllib.request.urlopen(COUNTRY_API_URL, timeout=5) as response:  # noqa: S310
-            country = response.read().decode("utf-8").strip().upper()
-    except (urllib.error.URLError, OSError, UnicodeDecodeError):
-        return False
+        with urllib.request.urlopen(request, timeout=SOURCE_PROBE_TIMEOUT_SECONDS):  # noqa: S310
+            pass
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
 
-    return country == "CN"
+    return time.monotonic() - start
 
 
-def _select_download_url(url: str) -> str:
-    """Select download URL with optional Hugging Face mirror in China."""
-    if not url.startswith(HF_ORIGIN):
-        return url
+def _rank_download_urls(urls: list[str]) -> list[str]:
+    """Rank candidate URLs by probe latency (fastest first)."""
+    if len(urls) <= 1:
+        return urls
 
-    if _is_in_china():
-        return url.replace(HF_ORIGIN, HF_MIRROR, 1)
+    results: dict[str, float] = {}
+    max_workers = min(4, len(urls))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {executor.submit(_probe_download_url, url): url for url in urls}
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            latency = future.result()
+            if latency is not None:
+                results[url] = latency
 
-    return url
+    ranked_ok = sorted(results, key=lambda url: results[url])
+    ranked_failed = [url for url in urls if url not in results]
+    return ranked_ok + ranked_failed
 
 
 def _available_model_names() -> list[str]:
     """Return available model names from packaged model registry."""
-    return sorted(_load_model_map())
+    return sorted(_load_model_map().keys())
 
 
 def resolve_model_path(model_name: str) -> Path:
@@ -106,12 +145,12 @@ def resolve_model_path(model_name: str) -> Path:
         msg = f"Unknown model: {model_name}. Available models: {available}"
         raise ValueError(msg)
 
-    filename = model_info["filename"]
+    filename = str(model_info["filename"])
     output_path = DEFAULT_CACHE_DIR / filename
 
     if output_path.exists():
         actual_sha256 = _sha256sum(output_path)
-        if actual_sha256 == model_info["sha256"]:
+        if actual_sha256 == str(model_info["sha256"]):
             return output_path
 
     code = download_model(model_name)
@@ -132,10 +171,8 @@ def download_model(model_name: str) -> int:
         LOGGER.error("Available models: %s", available)
         return 2
 
-    filename = model_info["filename"]
-    original_url = model_info["url"]
-    download_url = _select_download_url(original_url)
-    expected_sha256 = model_info["sha256"]
+    filename = str(model_info["filename"])
+    expected_sha256 = str(model_info["sha256"])
     output_path = DEFAULT_CACHE_DIR / filename
 
     if output_path.exists():
@@ -151,26 +188,45 @@ def download_model(model_name: str) -> int:
         )
         output_path.unlink(missing_ok=True)
 
+    candidate_urls = _model_download_urls(model_info)
+    if not candidate_urls:
+        LOGGER.error("No download URL configured for model '%s'", model_name)
+        return 1
+
+    ranked_urls = _rank_download_urls(candidate_urls)
+    if len(ranked_urls) > 1:
+        LOGGER.info(
+            "Selecting fastest source among %d candidates...",
+            len(ranked_urls),
+        )
+
     LOGGER.info("Downloading '%s'...", model_name)
-    if download_url != original_url:
-        LOGGER.info("Detected CN region, using mirror: %s", HF_MIRROR)
-    try:
-        _download_file(download_url, output_path)
-    except (urllib.error.URLError, OSError):
-        LOGGER.exception("Failed to download '%s'", model_name)
-        return 1
+    for idx, download_url in enumerate(ranked_urls, start=1):
+        LOGGER.info("Attempt %d/%d: %s", idx, len(ranked_urls), download_url)
+        try:
+            _download_file(download_url, output_path)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            LOGGER.warning("Download attempt failed from %s: %s", download_url, exc)
+            continue
 
-    actual_sha256 = _sha256sum(output_path)
-    if actual_sha256 != expected_sha256:
-        output_path.unlink(missing_ok=True)
-        LOGGER.error("Downloaded '%s' but SHA256 verification failed.", model_name)
-        LOGGER.error("Expected: %s", expected_sha256)
-        LOGGER.error("Actual:   %s", actual_sha256)
-        return 1
+        actual_sha256 = _sha256sum(output_path)
+        if actual_sha256 != expected_sha256:
+            output_path.unlink(missing_ok=True)
+            LOGGER.warning(
+                "Downloaded '%s' from %s but SHA256 verification failed.",
+                model_name,
+                download_url,
+            )
+            LOGGER.warning("Expected: %s", expected_sha256)
+            LOGGER.warning("Actual:   %s", actual_sha256)
+            continue
 
-    LOGGER.info("Downloaded '%s' to:", model_name)
-    LOGGER.info("%s", output_path)
-    return 0
+        LOGGER.info("Downloaded '%s' to:", model_name)
+        LOGGER.info("%s", output_path)
+        return 0
+
+    LOGGER.error("Failed to download '%s' from all configured sources.", model_name)
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:

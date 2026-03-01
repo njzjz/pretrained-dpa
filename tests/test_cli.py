@@ -6,19 +6,20 @@ import hashlib
 import io
 import logging
 import urllib.error
+from pathlib import Path
 
 import pytest
 
 from pretrained_dpa import cli
 
 MODEL_NAME = "DPA-3.2-5M"
-MODEL_URL = "https://example.com/DPA-3.2-5M.pt"
+MODEL_URL_1 = "https://example.com/DPA-3.2-5M-a.pt"
+MODEL_URL_2 = "https://example.com/DPA-3.2-5M-b.pt"
 MODEL_FILENAME = "DPA-3.2-5M.pt"
-HF_MODEL_URL = "https://huggingface.co/deepmodelingcommunity/DPA-3.2-5M/resolve/main/DPA-3.2-5M.pt?download=true"
 
 
 class ResponseOK:
-    """Minimal context-manager response object for successful downloads."""
+    """Minimal context-manager response object for successful requests."""
 
     def __init__(self, payload: bytes) -> None:
         self._stream = io.BytesIO(payload)
@@ -54,16 +55,22 @@ class ResponseFail:
 def _model_map_with_hash(
     sha256: str,
     *,
-    url: str = MODEL_URL,
-) -> dict[str, dict[str, str]]:
+    urls: list[str] | None = None,
+    url: str | None = None,
+) -> dict[str, dict[str, object]]:
     """Create a predictable model mapping for tests."""
-    return {
-        MODEL_NAME: {
-            "url": url,
-            "filename": MODEL_FILENAME,
-            "sha256": sha256,
-        },
+    model_info: dict[str, object] = {
+        "filename": MODEL_FILENAME,
+        "sha256": sha256,
     }
+    if urls is not None:
+        model_info["urls"] = urls
+    elif url is not None:
+        model_info["url"] = url
+    else:
+        model_info["urls"] = [MODEL_URL_1]
+
+    return {MODEL_NAME: model_info}
 
 
 def test_configure_logging_sets_info_level() -> None:
@@ -78,6 +85,37 @@ def test_configure_logging_sets_info_level() -> None:
     finally:
         root.handlers = original_handlers
         root.setLevel(original_level)
+
+
+def test_available_model_names_sorted(monkeypatch) -> None:
+    """Available model names should be sorted alphabetically."""
+    monkeypatch.setattr(
+        cli,
+        "_load_model_map",
+        lambda: {
+            "DPA-3.2-5M": {},
+            "DPA-3.1-3M": {},
+        },
+    )
+
+    assert cli._available_model_names() == ["DPA-3.1-3M", "DPA-3.2-5M"]
+
+
+def test_model_download_urls_prefers_urls_list_and_deduplicates() -> None:
+    """`urls` list should be used and deduplicated in order."""
+    model_info = {
+        "urls": [MODEL_URL_1, MODEL_URL_1, MODEL_URL_2],
+        "url": "https://example.com/legacy.pt",
+    }
+
+    assert cli._model_download_urls(model_info) == [MODEL_URL_1, MODEL_URL_2]
+
+
+def test_model_download_urls_falls_back_to_url_field() -> None:
+    """Single `url` should be supported for backward compatibility."""
+    model_info = {"url": MODEL_URL_1}
+
+    assert cli._model_download_urls(model_info) == [MODEL_URL_1]
 
 
 def test_parser_model_choices_from_registry(monkeypatch) -> None:
@@ -103,6 +141,79 @@ def test_parser_rejects_unknown_choice(monkeypatch) -> None:
         parser.parse_args(["download", "NOT-EXIST"])
 
     assert exc.value.code == 2
+
+
+def test_download_file_rejects_non_https_scheme(tmp_path) -> None:
+    """Downloader should reject URLs that are not HTTPS."""
+    destination = tmp_path / "cache" / MODEL_FILENAME
+
+    with pytest.raises(ValueError, match="Unsupported URL scheme"):
+        cli._download_file("http://example.com/model.pt", destination)
+
+
+def test_download_file_cleans_part_on_failure(monkeypatch, tmp_path) -> None:
+    """Downloader should clean up the .part file if stream copy fails."""
+    destination = tmp_path / "cache" / MODEL_FILENAME
+    part_path = destination.with_suffix(destination.suffix + ".part")
+
+    def fake_urlopen(_url: str, timeout: int = 120):
+        assert timeout == cli.DOWNLOAD_TIMEOUT_SECONDS
+        return ResponseFail()
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(OSError, match="boom"):
+        cli._download_file("https://example.com/model.pt", destination)
+
+    assert not destination.exists()
+    assert not part_path.exists()
+
+
+def test_probe_download_url_success(monkeypatch) -> None:
+    """Probe should return latency value for reachable URL."""
+
+    def fake_urlopen(req, timeout: int = 8):
+        assert req.full_url == MODEL_URL_1
+        assert timeout == cli.SOURCE_PROBE_TIMEOUT_SECONDS
+        return ResponseOK(b"x")
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+
+    latency = cli._probe_download_url(MODEL_URL_1)
+    assert latency is not None
+    assert latency >= 0
+
+
+def test_probe_download_url_failure_returns_none(monkeypatch) -> None:
+    """Probe should return None for unreachable URL."""
+
+    def fake_urlopen(_req, timeout: int = 8):
+        assert timeout == cli.SOURCE_PROBE_TIMEOUT_SECONDS
+        msg = "offline"
+        raise urllib.error.URLError(msg)
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+
+    assert cli._probe_download_url(MODEL_URL_1) is None
+
+
+def test_rank_download_urls_fastest_first(monkeypatch) -> None:
+    """Ranker should place reachable URLs by latency then failed URLs."""
+
+    def fake_probe(url: str) -> float | None:
+        mapping = {
+            MODEL_URL_1: 0.3,
+            MODEL_URL_2: 0.1,
+            "https://example.com/fail": None,
+        }
+        return mapping[url]
+
+    monkeypatch.setattr(cli, "_probe_download_url", fake_probe)
+
+    ranked = cli._rank_download_urls(
+        [MODEL_URL_1, MODEL_URL_2, "https://example.com/fail"],
+    )
+    assert ranked == [MODEL_URL_2, MODEL_URL_1, "https://example.com/fail"]
 
 
 def test_resolve_model_path_returns_existing_when_hash_matches(
@@ -157,6 +268,26 @@ def test_download_unknown_model_uses_packaged_map(caplog) -> None:
     assert MODEL_NAME in caplog.text
 
 
+def test_download_no_source_configured(monkeypatch, caplog) -> None:
+    """Downloader should fail when no source URL is configured."""
+    monkeypatch.setattr(
+        cli,
+        "_load_model_map",
+        lambda: {
+            MODEL_NAME: {
+                "filename": MODEL_FILENAME,
+                "sha256": "0" * 64,
+            },
+        },
+    )
+
+    with caplog.at_level(logging.ERROR):
+        code = cli.download_model(MODEL_NAME)
+
+    assert code == 1
+    assert "No download URL configured" in caplog.text
+
+
 def test_download_existing_model_skips_download(monkeypatch, tmp_path, caplog) -> None:
     """If model file exists and hash matches, downloader should not run."""
     model_dir = tmp_path / "cache"
@@ -169,9 +300,11 @@ def test_download_existing_model_skips_download(monkeypatch, tmp_path, caplog) -
     monkeypatch.setattr(
         cli,
         "_load_model_map",
-        lambda: _model_map_with_hash(hashlib.sha256(payload).hexdigest()),
+        lambda: _model_map_with_hash(
+            hashlib.sha256(payload).hexdigest(),
+            urls=[MODEL_URL_1],
+        ),
     )
-    monkeypatch.setattr(cli, "_select_download_url", lambda _url: MODEL_URL)
 
     with caplog.at_level(logging.INFO):
         code = cli.download_model(MODEL_NAME)
@@ -181,203 +314,121 @@ def test_download_existing_model_skips_download(monkeypatch, tmp_path, caplog) -
     assert str(model_file) in caplog.text
 
 
-def test_download_file_rejects_non_https_scheme(tmp_path) -> None:
-    """Downloader should reject URLs that are not HTTPS."""
-    destination = tmp_path / "cache" / MODEL_FILENAME
-
-    with pytest.raises(ValueError, match="Unsupported URL scheme"):
-        cli._download_file("http://example.com/model.pt", destination)
-
-
-def test_download_model_success(monkeypatch, tmp_path, caplog) -> None:
-    """Download command should write target file and report path."""
+def test_download_tries_sources_in_ranked_order(monkeypatch, tmp_path, caplog) -> None:
+    """Downloader should try ranked sources and succeed on a later source."""
     model_dir = tmp_path / "cache"
     model_file = model_dir / MODEL_FILENAME
-    payload = b"fake-model"
+    payload = b"good-model"
+    expected_sha = hashlib.sha256(payload).hexdigest()
 
     monkeypatch.setattr(cli, "DEFAULT_CACHE_DIR", model_dir)
     monkeypatch.setattr(
         cli,
         "_load_model_map",
-        lambda: _model_map_with_hash(hashlib.sha256(payload).hexdigest()),
+        lambda: _model_map_with_hash(
+            expected_sha,
+            urls=[MODEL_URL_1, MODEL_URL_2],
+        ),
     )
-    monkeypatch.setattr(cli, "_select_download_url", lambda _url: MODEL_URL)
+    monkeypatch.setattr(
+        cli,
+        "_rank_download_urls",
+        lambda _urls: [MODEL_URL_1, MODEL_URL_2],
+    )
 
-    def fake_urlopen(url: str, timeout: int = 120) -> ResponseOK:
-        """Return deterministic payload without network access."""
-        assert MODEL_FILENAME in url
-        assert timeout == 120
-        return ResponseOK(payload)
+    attempted: list[str] = []
 
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    def fake_download(url: str, destination: Path) -> None:
+        attempted.append(url)
+        if url == MODEL_URL_1:
+            msg = "timeout"
+            raise urllib.error.URLError(msg)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+
+    monkeypatch.setattr(cli, "_download_file", fake_download)
 
     with caplog.at_level(logging.INFO):
         code = cli.download_model(MODEL_NAME)
 
     assert code == 0
-    assert model_file.exists()
+    assert attempted == [MODEL_URL_1, MODEL_URL_2]
     assert model_file.read_bytes() == payload
-    assert f"Downloaded '{MODEL_NAME}' to:" in caplog.text
-    assert str(model_file) in caplog.text
 
 
-def test_download_model_bad_hash_is_removed(monkeypatch, tmp_path, caplog) -> None:
-    """Downloaded file with wrong hash should be removed and return error."""
-    model_dir = tmp_path / "cache"
-    model_file = model_dir / MODEL_FILENAME
-    monkeypatch.setattr(cli, "DEFAULT_CACHE_DIR", model_dir)
-    monkeypatch.setattr(cli, "_load_model_map", lambda: _model_map_with_hash("0" * 64))
-    monkeypatch.setattr(cli, "_select_download_url", lambda _url: MODEL_URL)
-
-    def fake_urlopen(_url: str, timeout: int = 120) -> ResponseOK:
-        """Return deterministic payload without network access."""
-        assert timeout == 120
-        return ResponseOK(b"corrupted")
-
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
-
-    with caplog.at_level(logging.ERROR):
-        code = cli.download_model(MODEL_NAME)
-
-    assert code == 1
-    assert "SHA256 verification failed" in caplog.text
-    assert "Expected:" in caplog.text
-    assert "Actual:" in caplog.text
-    assert not model_file.exists()
-
-
-def test_download_existing_bad_hash_triggers_redownload(
+def test_download_bad_checksum_falls_back_to_next_source(
     monkeypatch,
     tmp_path,
     caplog,
 ) -> None:
-    """Bad cached file should be removed and replaced by downloaded content."""
+    """Checksum failure from one source should continue to next source."""
     model_dir = tmp_path / "cache"
     model_file = model_dir / MODEL_FILENAME
-    model_dir.mkdir(parents=True, exist_ok=True)
-    model_file.write_bytes(b"bad-cache")
-
     good_payload = b"good-model"
+    expected_sha = hashlib.sha256(good_payload).hexdigest()
+
     monkeypatch.setattr(cli, "DEFAULT_CACHE_DIR", model_dir)
     monkeypatch.setattr(
         cli,
         "_load_model_map",
-        lambda: _model_map_with_hash(hashlib.sha256(good_payload).hexdigest()),
+        lambda: _model_map_with_hash(
+            expected_sha,
+            urls=[MODEL_URL_1, MODEL_URL_2],
+        ),
     )
-    monkeypatch.setattr(cli, "_select_download_url", lambda _url: MODEL_URL)
+    monkeypatch.setattr(
+        cli,
+        "_rank_download_urls",
+        lambda _urls: [MODEL_URL_1, MODEL_URL_2],
+    )
 
-    def fake_urlopen(_url: str, timeout: int = 120) -> ResponseOK:
-        """Return deterministic payload without network access."""
-        assert timeout == 120
-        return ResponseOK(good_payload)
+    def fake_download(url: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if url == MODEL_URL_1:
+            destination.write_bytes(b"corrupted")
+            return
+        destination.write_bytes(good_payload)
 
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cli, "_download_file", fake_download)
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.WARNING):
         code = cli.download_model(MODEL_NAME)
 
     assert code == 0
-    assert "failed SHA256 check, re-downloading" in caplog.text
+    assert "SHA256 verification failed" in caplog.text
     assert model_file.read_bytes() == good_payload
 
 
-def test_download_network_error_returns_one(monkeypatch, caplog, tmp_path) -> None:
-    """Failure during stream copy should return 1 and clean temporary files."""
+def test_download_all_sources_fail_returns_one(monkeypatch, tmp_path, caplog) -> None:
+    """Downloader should fail when all sources are unreachable."""
     model_dir = tmp_path / "cache"
-    output_path = model_dir / MODEL_FILENAME
-    part_path = output_path.with_suffix(".pt.part")
 
-    payload = b"ok"
     monkeypatch.setattr(cli, "DEFAULT_CACHE_DIR", model_dir)
     monkeypatch.setattr(
         cli,
         "_load_model_map",
-        lambda: _model_map_with_hash(hashlib.sha256(payload).hexdigest()),
+        lambda: _model_map_with_hash(
+            "0" * 64,
+            urls=[MODEL_URL_1, MODEL_URL_2],
+        ),
     )
-    monkeypatch.setattr(cli, "_select_download_url", lambda _url: MODEL_URL)
+    monkeypatch.setattr(
+        cli,
+        "_rank_download_urls",
+        lambda _urls: [MODEL_URL_1, MODEL_URL_2],
+    )
 
-    def fake_urlopen(_url: str, timeout: int = 120) -> ResponseFail:
-        """Return failing response object."""
-        assert timeout == 120
-        return ResponseFail()
+    def fake_download(_url: str, _destination: Path) -> None:
+        msg = "unreachable"
+        raise urllib.error.URLError(msg)
 
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cli, "_download_file", fake_download)
 
     with caplog.at_level(logging.ERROR):
         code = cli.download_model(MODEL_NAME)
 
     assert code == 1
     assert "Failed to download" in caplog.text
-    assert not output_path.exists()
-    assert not part_path.exists()
-
-
-def test_download_uses_mirror_in_cn(monkeypatch, tmp_path, caplog) -> None:
-    """Download should use hf-mirror when country API reports CN."""
-    model_dir = tmp_path / "cache"
-    payload = b"mirror-model"
-    mirror_url = HF_MODEL_URL.replace(cli.HF_ORIGIN, cli.HF_MIRROR, 1)
-
-    monkeypatch.setattr(cli, "DEFAULT_CACHE_DIR", model_dir)
-    monkeypatch.setattr(
-        cli,
-        "_load_model_map",
-        lambda: _model_map_with_hash(
-            hashlib.sha256(payload).hexdigest(),
-            url=HF_MODEL_URL,
-        ),
-    )
-
-    def fake_urlopen(url: str, timeout: int = 120) -> ResponseOK:
-        """Return country first, then model payload from selected URL."""
-        if url == cli.COUNTRY_API_URL:
-            assert timeout == 5
-            return ResponseOK(b"CN\n")
-
-        assert url == mirror_url
-        assert timeout == 120
-        return ResponseOK(payload)
-
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
-
-    with caplog.at_level(logging.INFO):
-        code = cli.download_model(MODEL_NAME)
-
-    assert code == 0
-    assert "using mirror" in caplog.text
-
-
-def test_download_country_check_failure_falls_back_to_origin(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    """If country API fails, download should fall back to huggingface origin URL."""
-    model_dir = tmp_path / "cache"
-    payload = b"origin-model"
-
-    monkeypatch.setattr(cli, "DEFAULT_CACHE_DIR", model_dir)
-    monkeypatch.setattr(
-        cli,
-        "_load_model_map",
-        lambda: _model_map_with_hash(
-            hashlib.sha256(payload).hexdigest(),
-            url=HF_MODEL_URL,
-        ),
-    )
-
-    def fake_urlopen(url: str, timeout: int = 120) -> ResponseOK:
-        """Raise on country API and serve payload from origin URL."""
-        if url == cli.COUNTRY_API_URL:
-            msg = "country-unreachable"
-            raise urllib.error.URLError(msg)
-
-        assert url == HF_MODEL_URL
-        assert timeout == 120
-        return ResponseOK(payload)
-
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
-
-    assert cli.download_model(MODEL_NAME) == 0
 
 
 def test_main_download_success(monkeypatch, tmp_path) -> None:
@@ -391,13 +442,12 @@ def test_main_download_success(monkeypatch, tmp_path) -> None:
         "_load_model_map",
         lambda: _model_map_with_hash(hashlib.sha256(payload).hexdigest()),
     )
-    monkeypatch.setattr(cli, "_select_download_url", lambda _url: MODEL_URL)
+    monkeypatch.setattr(cli, "_rank_download_urls", lambda _urls: _urls)
 
-    def fake_urlopen(_url: str, timeout: int = 120) -> ResponseOK:
-        """Return deterministic payload without network access."""
-        assert timeout == 120
-        return ResponseOK(payload)
+    def fake_download(_url: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
 
-    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(cli, "_download_file", fake_download)
 
     assert cli.main(["download", MODEL_NAME]) == 0
